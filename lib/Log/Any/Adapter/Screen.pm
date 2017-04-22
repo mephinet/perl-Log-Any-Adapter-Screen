@@ -1,4 +1,4 @@
-package Log::Any::Adapter::Screen;
+package Log::Any::Adapter::Screen; # -*- notidy -*-
 
 # DATE
 # VERSION
@@ -11,8 +11,13 @@ use Log::Any;
 use Log::Any::Adapter::Util qw(make_method);
 use parent qw(Log::Any::Adapter::Base);
 
+use Data::Dumper;
+use Term::ReadKey 'GetTerminalSize';
+use Time::HiRes;
+
 my $CODE_RESET = do { require Term::ANSIColor; Term::ANSIColor::color('reset') }; # PRECOMPUTE
 my $DEFAULT_COLORS = do { require Term::ANSIColor; my $tmp = {trace=>'yellow', debug=>'', info=>'green',notice=>'green',warning=>'bold blue',error=>'magenta',critical=>'red',alert=>'red',emergency=>'red'}; for (keys %$tmp) { if ($tmp->{$_}) { $tmp->{$_} = Term::ANSIColor::color($tmp->{$_}) } }; $tmp }; # PRECOMPUTE
+my $CODE_FAINT = do { require Term::ANSIColor; Term::ANSIColor::color('faint') }; # PRECOMPUTE
 
 my $Time0;
 
@@ -40,7 +45,8 @@ sub init {
     my ($self) = @_;
     $self->{default_level} //= 'warning';
     $self->{stderr}    //= 1;
-    $self->{use_color} //= $ENV{COLOR} // (-t STDOUT);
+    $self->{_fh} = $self->{stderr} ? \*STDERR : \*STDOUT;
+    $self->{use_color} //= $ENV{COLOR} // (-t $self->{_fh});
     if ($self->{colors}) {
         require Term::ANSIColor;
         # convert color names to escape sequence
@@ -53,22 +59,7 @@ sub init {
         $self->{colors} = $DEFAULT_COLORS;
     }
     $self->{min_level} //= $self->_min_level;
-    if (!$self->{formatter}) {
-        if (($ENV{LOG_PREFIX} // '') eq 'elapsed') {
-            require Time::HiRes;
-            $Time0 //= Time::HiRes::time();
-        }
-        $self->{formatter} = sub {
-            my ($self, $msg) = @_;
-            my $env = $ENV{LOG_PREFIX} // '';
-            if ($env eq 'elapsed') {
-                my $time = Time::HiRes::time();
-                $msg = sprintf("[%9.3fms] %s", ($time - $Time0)*1000, $msg);
-            }
-            $msg;
-        };
-    }
-    $self->{_fh} = $self->{stderr} ? \*STDERR : \*STDOUT;
+    $Time0 //= Time::HiRes::time();
 }
 
 sub hook_before_log {
@@ -81,30 +72,37 @@ sub hook_after_log {
     print { $self->{_fh} } "\n" unless $msg =~ /\n\z/;
 }
 
-for my $method (Log::Any->logging_methods()) {
-    make_method(
-        $method,
-        sub {
-            my ($self, $msg) = @_;
+sub structured {
+    my ( $self, $level, $category, @args ) = @_;
 
-            return if $logging_levels{$method} <
-                $logging_levels{$self->{min_level}};
+    return
+        if $logging_levels{$level} < $logging_levels{ $self->{min_level} };
 
-            $self->hook_before_log($msg);
+    my $time        = Time::HiRes::time();
+    my $color_start = $self->{use_color} ? $self->{colors}{$level} : '';
+    my $color_end   = $self->{use_color} ? $CODE_RESET : '';
+    my @msgs        = grep { !ref } @args;
+    my $msg         = sprintf( '[%9.3fms] %s%9s ', ( $time - $Time0 ) * 1000, $color_start, uc $level);
+    $msg .= join ' ', @msgs;
 
-            if ($self->{formatter}) {
-                $msg = $self->{formatter}->($self, $msg);
-            }
+    my @data = grep {ref} @args;
+    if (@data) {
+        my $indent = ( ( GetTerminalSize( $self->{fh} ) )[0] // 80 ) / 3;
+        my $d = Data::Dumper->new( \@data );
+        $d->Terse(1)->Sortkeys(1)->Pad( ' ' x $indent )->Quotekeys(0)->Pair('=');
+        my $visi_length = length($msg) - length($color_start);
+        my $data_str =
+            ( $visi_length < ( $indent - 1 ) )
+            ? substr( $d->Dump(), $visi_length )
+            : "\n" . $d->Dump();
+        my $data_color_start = $self->{use_color} ? $CODE_FAINT : '';
+        $msg .= $data_color_start . $data_str;
+    }
+    $msg .= $color_end;
 
-            if ($self->{use_color} && $self->{colors}{$method}) {
-                $msg = $self->{colors}{$method} . $msg . $CODE_RESET;
-            }
-
-            print { $self->{_fh} } $msg;
-
-            $self->hook_after_log($msg);
-        }
-    );
+    $self->hook_before_log($msg);
+    print { $self->{_fh} } $msg;
+    $self->hook_after_log($msg);
 }
 
 for my $method (Log::Any->detection_methods()) {
@@ -121,7 +119,7 @@ for my $method (Log::Any->detection_methods()) {
 1;
 # ABSTRACT: Send logs to screen, with colors and some other features
 
-=for Pod::Coverage ^(init|hook_.+)$
+=for Pod::Coverage ^(init|hook_.+|structured)$
 
 =head1 SYNOPSIS
 
@@ -131,7 +129,6 @@ for my $method (Log::Any->detection_methods()) {
      # colors    => { trace => 'bold yellow on_gray', ... }, # customize colors
      # use_color => 1, # force color even when not interactive
      # stderr    => 0, # print to STDOUT instead of the default STDERR
-     # formatter => sub { "LOG: $_[1]" }, # default none
  );
 
 
@@ -139,8 +136,8 @@ for my $method (Log::Any->detection_methods()) {
 
 This Log::Any adapter prints log messages to screen (STDERR/STDOUT). The
 messages are colored according to level (unless coloring is turned off). It has
-a few other features: allow passing formatter, allow setting level from some
-environment variables, add prefix/timestamps.
+a few other features: allow setting level from some environment variables, add
+prefix/timestamps.
 
 Parameters:
 
@@ -181,25 +178,6 @@ The default colors are:
 Whether to print to STDERR, default is true. If set to 0, will print to STDOUT
 instead.
 
-=item * formatter => CODEREF
-
-Allow formatting message. If defined, message will be passed before being
-colorized. Coderef will be passed:
-
- ($self, $message)
-
-and is expected to return the formatted message.
-
-The default formatter can optionally prefix the message with extra stuffs,
-depending on the content of LOG_PREFIX environment variable, such as: elapsed
-time (e.g. C<< [0.023ms] >>) if LOG_PREFIX is C<elapsed>.
-
-NOTE: Log::Any 1.00+ now has a proxy object which allows
-formatting/customization of message before it is sent to adapter(s), so
-formatting does not have to be done on a per-adapter basis. As an alternative to
-this attribute, you can also consider using the proxy object or the (upcoming?)
-global proxy object.
-
 =item * default_level => STR (default: warning)
 
 If no level-setting environment variables are defined, will default to this
@@ -227,11 +205,6 @@ STDOUT>>.
 
 These environment variables can set the default for C<min_level>. See
 documentation about C<min_level> for more details.
-
-=head2 LOG_PREFIX => str
-
-The default formatter groks these variables. See documentation about
-C<formatter> about more details.
 
 
 =head1 SEE ALSO
